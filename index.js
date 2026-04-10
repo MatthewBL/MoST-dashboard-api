@@ -151,6 +151,74 @@ function inferModelFromUrl(rawUrl) {
   }
 }
 
+function normalizeEndpointBaseUrl(rawUrl) {
+  const cleaned = stripQuotes(rawUrl);
+  if (!cleaned) {
+    return null;
+  }
+
+  // Accept values with scheme, host:port, or full endpoint path.
+  try {
+    const parsed = new URL(cleaned);
+    if (!parsed.hostname) {
+      return null;
+    }
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    // Continue with host:port fallback.
+  }
+
+  if (cleaned.includes(" ") || cleaned.startsWith("/")) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(`http://${cleaned}`);
+    return parsed.host ? `${parsed.protocol}//${parsed.host}` : null;
+  } catch {
+    return null;
+  }
+}
+
+async function queryModelFromEndpoint(rawUrl, timeoutMs = 10_000) {
+  const baseUrl = normalizeEndpointBaseUrl(rawUrl);
+  if (!baseUrl) {
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const modelsUrl = new URL("/v1/models", `${baseUrl}/`).toString();
+    const response = await fetch(modelsUrl, {
+      method: "GET",
+      headers: { Accept: "application/json", "User-Agent": "most-api/1.0" },
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = await response.json();
+    if (!payload || typeof payload !== "object" || !Array.isArray(payload.data) || payload.data.length === 0) {
+      return null;
+    }
+
+    const first = payload.data[0];
+    return first && typeof first.id === "string" && first.id.trim() ? first.id.trim() : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function isEndpointLike(rawUrl) {
+  return Boolean(normalizeEndpointBaseUrl(rawUrl));
+}
+
 function deepExtractModel(value) {
   if (!value || typeof value !== "object") {
     return null;
@@ -216,11 +284,15 @@ async function resolveLlmName() {
   const envCandidate = firstNonEmpty(
     process.env.LLM_NAME,
     process.env.MODEL_NAME,
-    process.env.MODEL,
     process.env.FMPERF_MODEL,
   );
   if (envCandidate) {
     return { llmName: envCandidate, source: "env" };
+  }
+
+  const modelEnv = firstNonEmpty(process.env.MODEL);
+  if (modelEnv && !isEndpointLike(modelEnv)) {
+    return { llmName: modelEnv, source: "env:MODEL" };
   }
 
   const latest = await findLatestIterationFolder();
@@ -252,6 +324,11 @@ async function resolveLlmName() {
         };
       }
     }
+  }
+
+  const modelFromEndpoint = await queryModelFromEndpoint(process.env.URL);
+  if (modelFromEndpoint) {
+    return { llmName: modelFromEndpoint, source: "env:URL:/v1/models" };
   }
 
   const modelFromUrl = inferModelFromUrl(process.env.URL);
