@@ -76,6 +76,34 @@ function stripQuotes(value) {
   return String(value || "").trim().replace(/^['\"]|['\"]$/g, "");
 }
 
+function parseCsvRows(csvText) {
+  try {
+    return {
+      rows: parse(csvText, {
+        columns: true,
+        skip_empty_lines: true,
+        trim: true,
+        bom: true,
+      }),
+      relaxed: false,
+    };
+  } catch {
+    // Some exported CSV files contain inconsistent columns or quotes.
+    // Retry with tolerant settings so dashboards can still consume most rows.
+    return {
+      rows: parse(csvText, {
+        columns: true,
+        skip_empty_lines: true,
+        trim: true,
+        bom: true,
+        relax_column_count: true,
+        relax_quotes: true,
+      }),
+      relaxed: true,
+    };
+  }
+}
+
 function inferGpuFromUrl(rawUrl) {
   const cleaned = stripQuotes(rawUrl);
   if (!cleaned) {
@@ -169,11 +197,7 @@ async function tryReadJson(filePath) {
 async function tryReadCsvRecords(filePath) {
   try {
     const text = await fs.readFile(filePath, "utf8");
-    return parse(text, {
-      columns: true,
-      skip_empty_lines: true,
-      trim: true,
-    });
+    return parseCsvRows(text).rows;
   } catch {
     return null;
   }
@@ -327,17 +351,22 @@ app.get("/api/experiments/:experiment/iterations/:iteration/results.csv", async 
       safeJoin(requestsRoot, experiment, iteration, "results.csv"),
     );
     const csvText = await fs.readFile(csvPath, "utf8");
-    const records = parse(csvText, {
-      columns: true,
-      skip_empty_lines: true,
-      trim: true,
-    });
+    let parsed;
+
+    try {
+      parsed = parseCsvRows(csvText);
+    } catch (parseError) {
+      parseError.code = "CSV_PARSE_FAILED";
+      parseError.message = "Unable to parse results.csv.";
+      throw parseError;
+    }
 
     res.json({
       experiment,
       iteration,
-      rows: records,
-      count: records.length,
+      rows: parsed.rows,
+      count: parsed.rows.length,
+      relaxedParsing: parsed.relaxed,
       source: toPosixRelative(csvPath),
     });
   } catch (error) {
@@ -370,8 +399,17 @@ app.get("/api/experiments/:experiment/iterations/:iteration/download/results.jso
 });
 
 app.use((error, _req, res, _next) => {
-  const status = error && (error.code === "ENOENT" || error.message === "Invalid path.") ? 404 : 500;
-  const message = status === 404 ? "Resource not found." : "Unexpected server error.";
+  let status = 500;
+  let message = "Unexpected server error.";
+
+  if (error && (error.code === "ENOENT" || error.message === "Invalid path.")) {
+    status = 404;
+    message = "Resource not found.";
+  } else if (error && error.code === "CSV_PARSE_FAILED") {
+    status = 422;
+    message = "The CSV file exists but could not be parsed.";
+  }
+
   res.status(status).json({ error: message });
 });
 
