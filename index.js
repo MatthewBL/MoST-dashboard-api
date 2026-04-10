@@ -1,5 +1,7 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const http = require("node:http");
+const https = require("node:https");
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
@@ -151,21 +153,19 @@ function inferModelFromUrl(rawUrl) {
   }
 }
 
-function normalizeEndpointBaseUrl(rawUrl) {
-  const cleaned = stripQuotes(rawUrl);
+function normalizeEndpointBaseUrl(rawValue) {
+  const cleaned = stripQuotes(rawValue);
   if (!cleaned) {
     return null;
   }
 
-  // Accept values with scheme, host:port, or full endpoint path.
   try {
     const parsed = new URL(cleaned);
-    if (!parsed.hostname) {
-      return null;
+    if (parsed.protocol && parsed.host) {
+      return `${parsed.protocol}//${parsed.host}`;
     }
-    return `${parsed.protocol}//${parsed.host}`;
   } catch {
-    // Continue with host:port fallback.
+    // Ignore and retry by assuming the scheme is missing.
   }
 
   if (cleaned.includes(" ") || cleaned.startsWith("/")) {
@@ -173,50 +173,82 @@ function normalizeEndpointBaseUrl(rawUrl) {
   }
 
   try {
-    const parsed = new URL(`http://${cleaned}`);
-    return parsed.host ? `${parsed.protocol}//${parsed.host}` : null;
+    const parsedWithScheme = new URL(`http://${cleaned}`);
+    return `${parsedWithScheme.protocol}//${parsedWithScheme.host}`;
   } catch {
     return null;
   }
 }
 
-async function queryModelFromEndpoint(rawUrl, timeoutMs = 10_000) {
-  const baseUrl = normalizeEndpointBaseUrl(rawUrl);
+async function queryModelFromEndpoint(rawEndpoint, timeoutMs = 10000) {
+  const baseUrl = normalizeEndpointBaseUrl(rawEndpoint);
   if (!baseUrl) {
     return null;
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
+  let payload;
   try {
-    const modelsUrl = new URL("/v1/models", `${baseUrl}/`).toString();
-    const response = await fetch(modelsUrl, {
-      method: "GET",
-      headers: { Accept: "application/json", "User-Agent": "most-api/1.0" },
-      signal: controller.signal,
+    payload = await new Promise((resolve, reject) => {
+      const target = new URL("/v1/models", `${baseUrl}/`);
+      const transport = target.protocol === "https:" ? https : http;
+      const request = transport.request(
+        target,
+        {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            "User-Agent": "most-api/1.0",
+          },
+        },
+        (response) => {
+          const statusCode = Number(response.statusCode || 0);
+          if (statusCode !== 200) {
+            response.resume();
+            resolve(null);
+            return;
+          }
+
+          let raw = "";
+          response.setEncoding("utf8");
+          response.on("data", (chunk) => {
+            raw += chunk;
+          });
+          response.on("end", () => {
+            try {
+              resolve(JSON.parse(raw));
+            } catch {
+              resolve(null);
+            }
+          });
+        },
+      );
+
+      request.setTimeout(timeoutMs, () => {
+        request.destroy(new Error("Request timed out"));
+      });
+
+      request.on("error", reject);
+      request.end();
     });
-
-    if (!response.ok) {
-      return null;
-    }
-
-    const payload = await response.json();
-    if (!payload || typeof payload !== "object" || !Array.isArray(payload.data) || payload.data.length === 0) {
-      return null;
-    }
-
-    const first = payload.data[0];
-    return first && typeof first.id === "string" && first.id.trim() ? first.id.trim() : null;
   } catch {
     return null;
-  } finally {
-    clearTimeout(timeout);
   }
-}
 
-function isEndpointLike(rawUrl) {
-  return Boolean(normalizeEndpointBaseUrl(rawUrl));
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.data) || payload.data.length === 0) {
+    return null;
+  }
+
+  const first = payload.data[0];
+  if (!first || typeof first !== "object") {
+    return null;
+  }
+
+  const modelId = first.id;
+  if (typeof modelId === "string" && modelId.trim()) {
+    return modelId.trim();
+  }
+
+  return null;
 }
 
 function deepExtractModel(value) {
@@ -281,59 +313,21 @@ function firstNonEmpty(...values) {
 }
 
 async function resolveLlmName() {
-  const envCandidate = firstNonEmpty(
-    process.env.LLM_NAME,
-    process.env.MODEL_NAME,
-    process.env.FMPERF_MODEL,
-  );
-  if (envCandidate) {
-    return { llmName: envCandidate, source: "env" };
-  }
+  const timeoutMs = Number(process.env.MODEL_DISCOVERY_TIMEOUT || 10) * 1000;
+  const endpointCandidates = [
+    process.env.URL,
+    process.env.FMPERF_ENDPOINT_URL,
+    process.env.ENDPOINT_URL,
+  ];
 
-  const modelEnv = firstNonEmpty(process.env.MODEL);
-  if (modelEnv && !isEndpointLike(modelEnv)) {
-    return { llmName: modelEnv, source: "env:MODEL" };
-  }
-
-  const latest = await findLatestIterationFolder();
-  if (latest) {
-    const jsonData = await tryReadJson(path.join(latest.path, "results.json"));
-    const modelFromJson = deepExtractModel(jsonData);
-    if (modelFromJson) {
+  for (const endpoint of endpointCandidates) {
+    const modelFromEndpoint = await queryModelFromEndpoint(endpoint, timeoutMs);
+    if (modelFromEndpoint) {
       return {
-        llmName: modelFromJson,
-        source: `requests/${latest.experiment}/${latest.iteration}/results.json`,
+        llmName: modelFromEndpoint,
+        source: "env:/v1/models",
       };
     }
-
-    const csvRecords = await tryReadCsvRecords(path.join(latest.path, "results.csv"));
-    if (csvRecords && csvRecords.length > 0) {
-      const row = csvRecords[0];
-      const modelFromCsv = firstNonEmpty(
-        row.MODEL,
-        row.model,
-        row.MODEL_NAME,
-        row.model_name,
-        row.LLM,
-        row.llm,
-      );
-      if (modelFromCsv) {
-        return {
-          llmName: modelFromCsv,
-          source: `requests/${latest.experiment}/${latest.iteration}/results.csv`,
-        };
-      }
-    }
-  }
-
-  const modelFromEndpoint = await queryModelFromEndpoint(process.env.URL);
-  if (modelFromEndpoint) {
-    return { llmName: modelFromEndpoint, source: "env:URL:/v1/models" };
-  }
-
-  const modelFromUrl = inferModelFromUrl(process.env.URL);
-  if (modelFromUrl) {
-    return { llmName: modelFromUrl, source: "env:URL" };
   }
 
   return { llmName: "unknown", source: "unavailable" };
