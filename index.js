@@ -115,7 +115,7 @@ function getResultsScopeFromRequest(req) {
 async function listResultsScopes() {
   const directoryNames = await listDirectories(requestsRoot).catch(() => []);
   const detectedRoundScopes = directoryNames
-    .filter((name) => /^MST-\d+$/i.test(name))
+    .filter((name) => /^MST[-_]\d+$/i.test(name))
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
 
   return [DEFAULT_RESULTS_SCOPE, ...detectedRoundScopes];

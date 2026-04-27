@@ -30,5 +30,5 @@ By default, the API listens on `http://localhost:4000`.
 - `llm-name` and `gpu-used` are resolved from environment values first, then latest iteration result files.
 - The `results.csv` endpoint returns parsed rows as JSON for dashboard consumption.
 - Download endpoints return the raw files.
-- Experiment endpoints accept `?resultsScope=current|MST-1|MST-2|...`.
-- `current` reads from `requests/` directly, while other scopes read from subfolders like `requests/MST-1/`.
+- Experiment endpoints accept `?resultsScope=current|MST_1|MST-2|...`.
+- `current` reads from `requests/` directly, while other scopes read from subfolders like `requests/MST_1/`.
