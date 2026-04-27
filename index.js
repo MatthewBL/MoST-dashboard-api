@@ -18,6 +18,7 @@ app.use(cors());
 app.use(express.json());
 
 const requestsRoot = path.resolve(projectRoot, process.env.REQUESTS_DIR || "requests");
+const DEFAULT_RESULTS_SCOPE = "current";
 
 function toPosixRelative(targetPath) {
   return path.relative(projectRoot, targetPath).split(path.sep).join("/");
@@ -41,9 +42,9 @@ async function listDirectories(dir) {
   return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
 }
 
-async function listExperimentFolders() {
+async function listExperimentFolders(basePath) {
   try {
-    const names = await listDirectories(requestsRoot);
+    const names = await listDirectories(basePath);
     return names
       .filter((name) => !name.startsWith(".") && name !== "__pycache__")
       .sort((a, b) => a.localeCompare(b));
@@ -52,26 +53,72 @@ async function listExperimentFolders() {
   }
 }
 
-async function listIterations(experiment) {
-  const experimentPath = safeJoin(requestsRoot, experiment);
+async function listIterations(experiment, basePath) {
+  const experimentPath = safeJoin(basePath, experiment);
   const names = await listDirectories(experimentPath);
   return names.filter((name) => !name.startsWith(".")).sort((a, b) => b.localeCompare(a));
 }
 
-async function findLatestIterationFolder() {
-  const experiments = await listExperimentFolders();
+async function findLatestIterationFolder(basePath) {
+  const experiments = await listExperimentFolders(basePath);
   for (const experiment of [...experiments].sort((a, b) => b.localeCompare(a))) {
-    const iterations = await listIterations(experiment).catch(() => []);
+    const iterations = await listIterations(experiment, basePath).catch(() => []);
     if (iterations.length > 0) {
       const iteration = iterations[0];
       return {
         experiment,
         iteration,
-        path: safeJoin(requestsRoot, experiment, iteration),
+        path: safeJoin(basePath, experiment, iteration),
       };
     }
   }
   return null;
+}
+
+function normalizeResultsScope(rawScope) {
+  const normalized = String(rawScope || DEFAULT_RESULTS_SCOPE).trim();
+  if (!normalized || normalized.toLowerCase() === DEFAULT_RESULTS_SCOPE) {
+    return DEFAULT_RESULTS_SCOPE;
+  }
+
+  if (!/^[A-Za-z0-9._-]+$/.test(normalized)) {
+    const error = new Error("Invalid results scope.");
+    error.code = "INVALID_SCOPE";
+    throw error;
+  }
+
+  return normalized;
+}
+
+async function resolveRequestsBasePath(scope) {
+  if (scope === DEFAULT_RESULTS_SCOPE) {
+    return requestsRoot;
+  }
+
+  const scopedPath = safeJoin(requestsRoot, scope);
+  const stat = await fs.stat(scopedPath);
+  if (!stat.isDirectory()) {
+    const error = new Error("Results scope not found.");
+    error.code = "ENOENT";
+    throw error;
+  }
+
+  return scopedPath;
+}
+
+function getResultsScopeFromRequest(req) {
+  return normalizeResultsScope(
+    req.query.resultsScope || req.query.resultsSet || req.query.round || DEFAULT_RESULTS_SCOPE,
+  );
+}
+
+async function listResultsScopes() {
+  const directoryNames = await listDirectories(requestsRoot).catch(() => []);
+  const detectedRoundScopes = directoryNames
+    .filter((name) => /^MST-\d+$/i.test(name))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+
+  return [DEFAULT_RESULTS_SCOPE, ...detectedRoundScopes];
 }
 
 function stripQuotes(value) {
@@ -333,7 +380,7 @@ async function resolveLlmName() {
   return { llmName: "unknown", source: "unavailable" };
 }
 
-async function resolveGpuUsed() {
+async function resolveGpuUsed(resultsBasePath) {
   const envCandidate = firstNonEmpty(
     process.env.GPU,
     process.env.GPU_USED,
@@ -344,7 +391,7 @@ async function resolveGpuUsed() {
     return { gpuUsed: envCandidate, source: "env" };
   }
 
-  const latest = await findLatestIterationFolder();
+  const latest = await findLatestIterationFolder(resultsBasePath);
   if (latest) {
     const csvRecords = await tryReadCsvRecords(path.join(latest.path, "results.csv"));
     if (csvRecords && csvRecords.length > 0) {
@@ -388,16 +435,37 @@ app.get("/api/llm-name", async (_req, res) => {
   res.json(data);
 });
 
-app.get("/api/gpu-used", async (_req, res) => {
-  const data = await resolveGpuUsed();
-  res.json(data);
+app.get("/api/gpu-used", async (req, res, next) => {
+  try {
+    const resultsScope = getResultsScopeFromRequest(req);
+    const basePath = await resolveRequestsBasePath(resultsScope);
+    const data = await resolveGpuUsed(basePath);
+    res.json({
+      ...data,
+      resultsScope,
+      resultsRoot: toPosixRelative(basePath),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/results-scopes", async (_req, res) => {
+  const scopes = await listResultsScopes();
+  res.json({
+    scopes,
+    defaultScope: DEFAULT_RESULTS_SCOPE,
+  });
 });
 
 app.get("/api/experiments", async (_req, res, next) => {
   try {
-    const experiments = await listExperimentFolders();
+    const resultsScope = getResultsScopeFromRequest(_req);
+    const basePath = await resolveRequestsBasePath(resultsScope);
+    const experiments = await listExperimentFolders(basePath);
     res.json({
-      requestsRoot: toPosixRelative(requestsRoot),
+      requestsRoot: toPosixRelative(basePath),
+      resultsScope,
       experiments,
     });
   } catch (error) {
@@ -408,8 +476,10 @@ app.get("/api/experiments", async (_req, res, next) => {
 app.get("/api/experiments/:experiment/iterations", async (req, res, next) => {
   try {
     const { experiment } = req.params;
-    const iterations = await listIterations(experiment);
-    res.json({ experiment, iterations });
+    const resultsScope = getResultsScopeFromRequest(req);
+    const basePath = await resolveRequestsBasePath(resultsScope);
+    const iterations = await listIterations(experiment, basePath);
+    res.json({ experiment, iterations, resultsScope });
   } catch (error) {
     next(error);
   }
@@ -418,8 +488,10 @@ app.get("/api/experiments/:experiment/iterations", async (req, res, next) => {
 app.get("/api/experiments/:experiment/iterations/:iteration/results.csv", async (req, res, next) => {
   try {
     const { experiment, iteration } = req.params;
+    const resultsScope = getResultsScopeFromRequest(req);
+    const basePath = await resolveRequestsBasePath(resultsScope);
     const csvPath = await requireExistingFile(
-      safeJoin(requestsRoot, experiment, iteration, "results.csv"),
+      safeJoin(basePath, experiment, iteration, "results.csv"),
     );
     const csvText = await fs.readFile(csvPath, "utf8");
     let parsed;
@@ -435,6 +507,7 @@ app.get("/api/experiments/:experiment/iterations/:iteration/results.csv", async 
     res.json({
       experiment,
       iteration,
+      resultsScope,
       rows: parsed.rows,
       count: parsed.rows.length,
       relaxedParsing: parsed.relaxed,
@@ -448,8 +521,10 @@ app.get("/api/experiments/:experiment/iterations/:iteration/results.csv", async 
 app.get("/api/experiments/:experiment/iterations/:iteration/download/results.csv", async (req, res, next) => {
   try {
     const { experiment, iteration } = req.params;
+    const resultsScope = getResultsScopeFromRequest(req);
+    const basePath = await resolveRequestsBasePath(resultsScope);
     const csvPath = await requireExistingFile(
-      safeJoin(requestsRoot, experiment, iteration, "results.csv"),
+      safeJoin(basePath, experiment, iteration, "results.csv"),
     );
     res.download(csvPath, "results.csv");
   } catch (error) {
@@ -460,8 +535,10 @@ app.get("/api/experiments/:experiment/iterations/:iteration/download/results.csv
 app.get("/api/experiments/:experiment/iterations/:iteration/download/results.json", async (req, res, next) => {
   try {
     const { experiment, iteration } = req.params;
+    const resultsScope = getResultsScopeFromRequest(req);
+    const basePath = await resolveRequestsBasePath(resultsScope);
     const jsonPath = await requireExistingFile(
-      safeJoin(requestsRoot, experiment, iteration, "results.json"),
+      safeJoin(basePath, experiment, iteration, "results.json"),
     );
     res.download(jsonPath, "results.json");
   } catch (error) {
@@ -476,6 +553,9 @@ app.use((error, _req, res, _next) => {
   if (error && (error.code === "ENOENT" || error.message === "Invalid path.")) {
     status = 404;
     message = "Resource not found.";
+  } else if (error && error.code === "INVALID_SCOPE") {
+    status = 400;
+    message = "Invalid results scope.";
   } else if (error && error.code === "CSV_PARSE_FAILED") {
     status = 422;
     message = "The CSV file exists but could not be parsed.";
