@@ -17,7 +17,7 @@ const port = Number(process.env.PORT || 4000);
 app.use(cors());
 app.use(express.json());
 
-const requestsRoot = path.resolve(projectRoot, process.env.REQUESTS_DIR || "requests");
+const resultsRoot = path.resolve(projectRoot, process.env.RESULTS_DIR || "results");
 const DEFAULT_RESULTS_SCOPE = "current";
 
 function toPosixRelative(targetPath) {
@@ -90,12 +90,12 @@ function normalizeResultsScope(rawScope) {
   return normalized;
 }
 
-async function resolveRequestsBasePath(scope) {
+async function resolveResultsBasePath(scope) {
   if (scope === DEFAULT_RESULTS_SCOPE) {
-    return requestsRoot;
+    return resultsRoot;
   }
 
-  const scopedPath = safeJoin(requestsRoot, scope);
+  const scopedPath = safeJoin(resultsRoot, scope);
   const stat = await fs.stat(scopedPath);
   if (!stat.isDirectory()) {
     const error = new Error("Results scope not found.");
@@ -113,7 +113,7 @@ function getResultsScopeFromRequest(req) {
 }
 
 async function listResultsScopes() {
-  const directoryNames = await listDirectories(requestsRoot).catch(() => []);
+  const directoryNames = await listDirectories(resultsRoot).catch(() => []);
   const detectedRoundScopes = directoryNames
     .filter((name) => /^MST[-_]\d+$/i.test(name))
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
@@ -407,7 +407,7 @@ async function resolveGpuUsed(resultsBasePath) {
       if (gpuFromCsv) {
         return {
           gpuUsed: gpuFromCsv,
-          source: `requests/${latest.experiment}/${latest.iteration}/results.csv`,
+          source: `results/${latest.experiment}/${latest.iteration}/results.csv`,
         };
       }
     }
@@ -438,7 +438,7 @@ app.get("/api/llm-name", async (_req, res) => {
 app.get("/api/gpu-used", async (req, res, next) => {
   try {
     const resultsScope = getResultsScopeFromRequest(req);
-    const basePath = await resolveRequestsBasePath(resultsScope);
+    const basePath = await resolveResultsBasePath(resultsScope);
     const data = await resolveGpuUsed(basePath);
     res.json({
       ...data,
@@ -461,10 +461,10 @@ app.get("/api/results-scopes", async (_req, res) => {
 app.get("/api/experiments", async (_req, res, next) => {
   try {
     const resultsScope = getResultsScopeFromRequest(_req);
-    const basePath = await resolveRequestsBasePath(resultsScope);
+    const basePath = await resolveResultsBasePath(resultsScope);
     const experiments = await listExperimentFolders(basePath);
     res.json({
-      requestsRoot: toPosixRelative(basePath),
+      resultsRoot: toPosixRelative(basePath),
       resultsScope,
       experiments,
     });
@@ -477,7 +477,7 @@ app.get("/api/experiments/:experiment/iterations", async (req, res, next) => {
   try {
     const { experiment } = req.params;
     const resultsScope = getResultsScopeFromRequest(req);
-    const basePath = await resolveRequestsBasePath(resultsScope);
+    const basePath = await resolveResultsBasePath(resultsScope);
     const iterations = await listIterations(experiment, basePath);
     res.json({ experiment, iterations, resultsScope });
   } catch (error) {
@@ -489,7 +489,7 @@ app.get("/api/experiments/:experiment/iterations/:iteration/results.csv", async 
   try {
     const { experiment, iteration } = req.params;
     const resultsScope = getResultsScopeFromRequest(req);
-    const basePath = await resolveRequestsBasePath(resultsScope);
+    const basePath = await resolveResultsBasePath(resultsScope);
     const csvPath = await requireExistingFile(
       safeJoin(basePath, experiment, iteration, "results.csv"),
     );
@@ -522,7 +522,7 @@ app.get("/api/experiments/:experiment/iterations/:iteration/download/results.csv
   try {
     const { experiment, iteration } = req.params;
     const resultsScope = getResultsScopeFromRequest(req);
-    const basePath = await resolveRequestsBasePath(resultsScope);
+    const basePath = await resolveResultsBasePath(resultsScope);
     const csvPath = await requireExistingFile(
       safeJoin(basePath, experiment, iteration, "results.csv"),
     );
@@ -536,7 +536,7 @@ app.get("/api/experiments/:experiment/iterations/:iteration/download/results.jso
   try {
     const { experiment, iteration } = req.params;
     const resultsScope = getResultsScopeFromRequest(req);
-    const basePath = await resolveRequestsBasePath(resultsScope);
+    const basePath = await resolveResultsBasePath(resultsScope);
     const jsonPath = await requireExistingFile(
       safeJoin(basePath, experiment, iteration, "results.json"),
     );
@@ -566,5 +566,5 @@ app.use((error, _req, res, _next) => {
 
 app.listen(port, () => {
   console.log(`MoST API listening on http://localhost:${port}`);
-  console.log(`Reading experiments from: ${requestsRoot}`);
+  console.log(`Reading experiments from: ${resultsRoot}`);
 });

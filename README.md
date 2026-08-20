@@ -1,6 +1,6 @@
 # MoST Local API
 
-This folder contains a local Node.js API to expose experiment data under `../requests` for a local dashboard.
+This folder contains a local Node.js API to expose experiment data under `../results` for a local dashboard.
 
 ## Run
 
@@ -31,4 +31,4 @@ By default, the API listens on `http://localhost:4000`.
 - The `results.csv` endpoint returns parsed rows as JSON for dashboard consumption.
 - Download endpoints return the raw files.
 - Experiment endpoints accept `?resultsScope=current|MST_1|MST-2|...`.
-- `current` reads from `requests/` directly, while other scopes read from subfolders like `requests/MST_1/`.
+- `current` reads from `results/` directly, while other scopes read from subfolders like `results/MST_1/`.
