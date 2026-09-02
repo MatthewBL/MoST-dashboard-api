@@ -75,6 +75,10 @@ async function findLatestIterationFolder(basePath) {
   return null;
 }
 
+async function findCurrentExperiment(basePath) {
+  return findLatestIterationFolder(basePath);
+}
+
 function normalizeResultsScope(rawScope) {
   const normalized = String(rawScope || DEFAULT_RESULTS_SCOPE).trim();
   if (!normalized || normalized.toLowerCase() === DEFAULT_RESULTS_SCOPE) {
@@ -359,6 +363,141 @@ function firstNonEmpty(...values) {
   return null;
 }
 
+function normalizeFailureValue(value) {
+  if (value == null) {
+    return null;
+  }
+
+  const text = String(value).trim().toLowerCase();
+  if (!text) {
+    return null;
+  }
+
+  if (["failed", "fail", "error", "errored", "timeout", "timed_out", "false", "0"].includes(text)) {
+    return false;
+  }
+
+  if (["passed", "pass", "success", "ok", "true", "1", "completed", "done"].includes(text)) {
+    return true;
+  }
+
+  if (text.includes("fail")) {
+    return false;
+  }
+
+  if (text.includes("pass") || text.includes("success")) {
+    return true;
+  }
+
+  return null;
+}
+
+function deepExtractFailureStatus(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = deepExtractFailureStatus(item);
+      if (found !== null) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  for (const key of ["status", "result", "outcome", "success", "passed", "failed", "state"]) {
+    if (key in value) {
+      const normalized = normalizeFailureValue(value[key]);
+      if (normalized !== null) {
+        return normalized;
+      }
+    }
+  }
+
+  for (const nested of Object.values(value)) {
+    const found = deepExtractFailureStatus(nested);
+    if (found !== null) {
+      return found;
+    }
+  }
+
+  return null;
+}
+
+async function evaluateIterationFailure(experiment, iteration, basePath) {
+  const iterationDir = safeJoin(basePath, experiment, iteration);
+
+  try {
+    const jsonPath = path.join(iterationDir, "results.json");
+    const jsonText = await fs.readFile(jsonPath, "utf8");
+    const jsonData = JSON.parse(jsonText);
+    const parsed = deepExtractFailureStatus(jsonData);
+    if (parsed !== null) {
+      return parsed;
+    }
+  } catch {
+    // Ignore JSON parse failures and fall back to CSV inspection.
+  }
+
+  try {
+    const csvPath = path.join(iterationDir, "results.csv");
+    const csvText = await fs.readFile(csvPath, "utf8");
+    const rows = parseCsvRows(csvText).rows;
+
+    for (const row of rows) {
+      for (const [key, value] of Object.entries(row)) {
+        if (/status|result|outcome|success|pass|fail|error|state/i.test(key)) {
+          const normalized = normalizeFailureValue(value);
+          if (normalized !== null) {
+            return normalized;
+          }
+        }
+      }
+
+      for (const value of Object.values(row)) {
+        const normalized = normalizeFailureValue(value);
+        if (normalized !== null) {
+          return normalized;
+        }
+      }
+    }
+  } catch {
+    // Ignore CSV parsing failures.
+  }
+
+  return null;
+}
+
+async function getLastFourIterationsFailureStatus(experiment, basePath) {
+  const iterations = await listIterations(experiment, basePath).catch(() => []);
+  const recent = iterations.slice(0, 4);
+
+  const statuses = [];
+  for (const iteration of recent) {
+    const failed = await evaluateIterationFailure(experiment, iteration, basePath);
+    const normalizedStatus = failed === null ? "unknown" : failed ? "passed" : "failed";
+		statuses.push({
+      iteration,
+      failed: failed === false,
+      passed: failed === true,
+      status: normalizedStatus,
+    });
+  }
+
+  const lastFourFailed = recent.length >= 4 && statuses.every((item) => item.failed === true);
+
+  return {
+    experiment,
+    checkedIterations: recent,
+    window: 4,
+    statuses,
+    lastFourFailed,
+    allKnown: statuses.every((item) => item.status !== "unknown"),
+  };
+}
+
 async function resolveLlmName() {
   const timeoutMs = Number(process.env.MODEL_DISCOVERY_TIMEOUT || 10) * 1000;
   const endpointCandidates = [
@@ -473,6 +612,24 @@ app.get("/api/experiments", async (_req, res, next) => {
   }
 });
 
+app.get("/api/current-experiment", async (req, res, next) => {
+  try {
+    const resultsScope = getResultsScopeFromRequest(req);
+    const basePath = await resolveResultsBasePath(resultsScope);
+    const current = await findCurrentExperiment(basePath);
+
+    res.json({
+      resultsScope,
+      experiment: current ? current.experiment : null,
+      iteration: current ? current.iteration : null,
+      source: current ? toPosixRelative(current.path) : null,
+      isAvailable: Boolean(current),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/experiments/:experiment/iterations", async (req, res, next) => {
   try {
     const { experiment } = req.params;
@@ -480,6 +637,23 @@ app.get("/api/experiments/:experiment/iterations", async (req, res, next) => {
     const basePath = await resolveResultsBasePath(resultsScope);
     const iterations = await listIterations(experiment, basePath);
     res.json({ experiment, iterations, resultsScope });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/experiments/:experiment/last-four-failed", async (req, res, next) => {
+  try {
+    const { experiment } = req.params;
+    const resultsScope = getResultsScopeFromRequest(req);
+    const basePath = await resolveResultsBasePath(resultsScope);
+    const data = await getLastFourIterationsFailureStatus(experiment, basePath);
+
+    res.json({
+      experiment,
+      resultsScope,
+      ...data,
+    });
   } catch (error) {
     next(error);
   }
