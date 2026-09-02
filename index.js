@@ -61,18 +61,30 @@ async function listIterations(experiment, basePath) {
 
 async function findLatestIterationFolder(basePath) {
   const experiments = await listExperimentFolders(basePath);
-  for (const experiment of [...experiments].sort((a, b) => b.localeCompare(a))) {
+  const candidates = [];
+
+  for (const experiment of experiments) {
+    if (/^MST[-_]\d+$/i.test(experiment)) {
+      continue;
+    }
+
     const iterations = await listIterations(experiment, basePath).catch(() => []);
-    if (iterations.length > 0) {
-      const iteration = iterations[0];
-      return {
-        experiment,
-        iteration,
-        path: safeJoin(basePath, experiment, iteration),
-      };
+    for (const iteration of iterations) {
+      const iterationPath = safeJoin(basePath, experiment, iteration);
+      const stat = await fs.stat(iterationPath).catch(() => null);
+      if (stat) {
+        candidates.push({
+          experiment,
+          iteration,
+          path: iterationPath,
+          modifiedAt: stat.mtimeMs,
+        });
+      }
     }
   }
-  return null;
+
+  candidates.sort((left, right) => right.modifiedAt - left.modifiedAt);
+  return candidates.length > 0 ? candidates[0] : null;
 }
 
 async function findCurrentExperiment(basePath) {
