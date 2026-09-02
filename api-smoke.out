@@ -1,0 +1,4 @@
+◇ injected env (0) from ..\.env // tip: ⌘ override existing { override: true }
+◇ injected env (0) from .env // tip: ◈ secrets for agents [www.dotenvx.com]
+MoST API listening on http://localhost:4017
+Reading experiments from: C:\Users\Hola Isa\Documents\Tareas\Tesis\Implementación\MoST\New folder\results

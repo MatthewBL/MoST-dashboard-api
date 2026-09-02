@@ -29,6 +29,7 @@ By default, the API listens on `http://localhost:4000`.
 - The API reads `../.env` first (project root), then `api/.env` if present.
 - `llm-name` and `gpu-used` are resolved from environment values first, then latest iteration result files.
 - The `results.csv` endpoint returns parsed rows as JSON for dashboard consumption.
+- The parsed `results.csv` endpoint accepts an optional `fields` query parameter, for example `?fields=MODEL_USED,URL,LARGEST_TRUE`, to return only selected CSV columns. Without `fields`, it returns all columns.
 - Download endpoints return the raw files.
 - Experiment endpoints accept `?resultsScope=current|MST_1|MST-2|...`.
 - `current` reads from `results/` directly, while other scopes read from subfolders like `results/MST_1/`.

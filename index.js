@@ -157,6 +157,42 @@ function parseCsvRows(csvText) {
   }
 }
 
+function getRequestedCsvFields(req) {
+  const rawFields = req.query.fields;
+  if (rawFields === undefined) {
+    return null;
+  }
+
+  const fields = String(rawFields)
+    .split(",")
+    .map((field) => field.trim())
+    .filter(Boolean);
+
+  if (fields.length === 0) {
+    const error = new Error("The fields parameter cannot be empty.");
+    error.code = "INVALID_FIELDS";
+    throw error;
+  }
+
+  return [...new Set(fields)];
+}
+
+function selectCsvFields(rows, requestedFields) {
+  if (!requestedFields) {
+    return rows;
+  }
+
+  return rows.map((row) => {
+    const selected = {};
+    for (const field of requestedFields) {
+      if (Object.prototype.hasOwnProperty.call(row, field)) {
+        selected[field] = row[field];
+      }
+    }
+    return selected;
+  });
+}
+
 function inferGpuFromUrl(rawUrl) {
   const cleaned = stripQuotes(rawUrl);
   if (!cleaned) {
@@ -678,12 +714,16 @@ app.get("/api/experiments/:experiment/iterations/:iteration/results.csv", async 
       throw parseError;
     }
 
+    const requestedFields = getRequestedCsvFields(req);
+    const rows = selectCsvFields(parsed.rows, requestedFields);
+
     res.json({
       experiment,
       iteration,
       resultsScope,
-      rows: parsed.rows,
-      count: parsed.rows.length,
+      fields: requestedFields,
+      rows,
+      count: rows.length,
       relaxedParsing: parsed.relaxed,
       source: toPosixRelative(csvPath),
     });
@@ -730,6 +770,9 @@ app.use((error, _req, res, _next) => {
   } else if (error && error.code === "INVALID_SCOPE") {
     status = 400;
     message = "Invalid results scope.";
+  } else if (error && error.code === "INVALID_FIELDS") {
+    status = 400;
+    message = error.message;
   } else if (error && error.code === "CSV_PARSE_FAILED") {
     status = 422;
     message = "The CSV file exists but could not be parsed.";
