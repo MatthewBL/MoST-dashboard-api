@@ -6,6 +6,7 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const { parse } = require("csv-parse/sync");
+const { spawn } = require("node:child_process");
 
 const projectRoot = path.resolve(__dirname, process.env.MOST_PROJECT_ROOT || "..");
 dotenv.config({ path: path.join(projectRoot, ".env") });
@@ -19,6 +20,8 @@ app.use(express.json());
 
 const resultsRoot = path.resolve(projectRoot, process.env.RESULTS_DIR || "results");
 const DEFAULT_RESULTS_SCOPE = "current";
+const SLURM_LOG_PATTERN = /^slurm-(\d+)\.out$/;
+const SQUEUE_TIMEOUT_MS = 10000;
 
 function toPosixRelative(targetPath) {
   return path.relative(projectRoot, targetPath).split(path.sep).join("/");
@@ -613,6 +616,117 @@ async function requireExistingFile(filePath) {
   return filePath;
 }
 
+async function listSlurmLogs(basePath) {
+  const entries = await fs.readdir(basePath, { withFileTypes: true }).catch(() => []);
+  const logs = entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => {
+      const match = SLURM_LOG_PATTERN.exec(entry.name);
+      if (!match) {
+        return null;
+      }
+      const jobId = Number(match[1]);
+      if (!Number.isInteger(jobId) || jobId < 0) {
+        return null;
+      }
+      return {
+        name: entry.name,
+        jobId,
+        path: path.join(basePath, entry.name),
+      };
+    })
+    .filter((log) => log !== null)
+    .sort((left, right) => right.jobId - left.jobId);
+
+  return logs;
+}
+
+async function findLatestSlurmLog(basePath) {
+  const logs = await listSlurmLogs(basePath);
+  return logs.length > 0 ? logs[0] : null;
+}
+
+function runCommandCaptureStdout(command, args, timeoutMs = SQUEUE_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(command, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: timeoutMs,
+      });
+    } catch {
+      resolve(null);
+      return;
+    }
+
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+
+    const fail = () => resolve(null);
+    child.on("error", fail);
+    child.on("timeout", fail);
+    child.on("close", (code) => {
+      resolve(code === 0 ? stdout : null);
+    });
+  });
+}
+
+async function getRunningSlurmJobIds() {
+  const stdout = await runCommandCaptureStdout("squeue", ["--noheader", "--format=%i"]);
+  if (stdout === null) {
+    return null;
+  }
+
+  const jobIds = new Set();
+  for (const line of stdout.split(/\r?\n/)) {
+    const match = /^\s*(\d+)/.exec(line);
+    if (match) {
+      jobIds.add(Number(match[1]));
+    }
+  }
+  return jobIds;
+}
+
+async function resolveExperimentStatus(basePath) {
+  const latest = await findLatestSlurmLog(basePath);
+  const runningJobIds = await getRunningSlurmJobIds();
+
+  let isRunning = null;
+  if (runningJobIds && latest) {
+    isRunning = runningJobIds.has(latest.jobId);
+  }
+
+  return {
+    isRunning,
+    slurmJobId: latest ? latest.jobId : null,
+    logFile: latest ? latest.name : null,
+    logAvailable: Boolean(latest),
+    runningJobIds: runningJobIds ? [...runningJobIds].sort((a, b) => a - b) : null,
+    squeueAvailable: Boolean(runningJobIds),
+  };
+}
+
+async function readSlurmLogTail(filePath, maxLines) {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const lines = [];
+    let dropped = 0;
+    for await (const line of handle.readLines()) {
+      if (lines.length >= maxLines) {
+        lines.shift();
+        dropped += 1;
+      }
+      lines.push(line);
+    }
+    return { lines, dropped };
+  } finally {
+    await handle.close();
+  }
+}
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "most-api" });
 });
@@ -672,6 +786,66 @@ app.get("/api/current-experiment", async (req, res, next) => {
       iteration: current ? current.iteration : null,
       source: current ? toPosixRelative(current.path) : null,
       isAvailable: Boolean(current),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/experiment-status", async (_req, res, next) => {
+  try {
+    const data = await resolveExperimentStatus(projectRoot);
+    res.json(data);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/experiment-log", async (req, res, next) => {
+  try {
+    const latest = await findLatestSlurmLog(projectRoot);
+    if (!latest) {
+      const error = new Error("No slurm log files found.");
+      error.code = "NO_SLURM_LOG";
+      throw error;
+    }
+
+    const rawLines = req.query.lines;
+    let requestedLines = null;
+    if (rawLines !== undefined) {
+      const parsed = Number(rawLines);
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        const error = new Error("The lines parameter must be a positive integer.");
+        error.code = "INVALID_LINES";
+        throw error;
+      }
+      requestedLines = parsed;
+    }
+
+    const logInfo = {
+      slurmJobId: latest.jobId,
+      logFile: latest.name,
+      logPath: toPosixRelative(latest.path),
+    };
+
+    if (requestedLines === null) {
+      const content = await fs.readFile(latest.path, "utf8");
+      res.json({
+        ...logInfo,
+        truncated: false,
+        requestedLines: null,
+        content,
+      });
+      return;
+    }
+
+    const { lines, dropped } = await readSlurmLogTail(latest.path, requestedLines);
+    res.json({
+      ...logInfo,
+      truncated: dropped > 0,
+      requestedLines,
+      returnedLines: lines.length,
+      content: lines.join("\n"),
     });
   } catch (error) {
     next(error);
@@ -788,6 +962,12 @@ app.use((error, _req, res, _next) => {
   } else if (error && error.code === "CSV_PARSE_FAILED") {
     status = 422;
     message = "The CSV file exists but could not be parsed.";
+  } else if (error && error.code === "NO_SLURM_LOG") {
+    status = 404;
+    message = error.message;
+  } else if (error && error.code === "INVALID_LINES") {
+    status = 400;
+    message = error.message;
   }
 
   res.status(status).json({ error: message });
