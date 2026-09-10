@@ -9,4 +9,4 @@ if [ -f .env ]; then
 fi
 
 # Submit job, exporting full environment for the script
-sbatch --export=ALL --nodelist="${BACKEND_NODE}" --time="${DEPLOYMENT_PERIOD}" run_api.sh
+sbatch --export=ALL --nodelist="${BACKEND_NODE}" --time="${DEPLOYMENT_PERIOD}" most_api.sh
