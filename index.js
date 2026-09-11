@@ -904,6 +904,11 @@ app.get("/api/gpu-used", async (req, res, next) => {
     const data = await resolveGpuUsed(basePath);
     res.json({
       ...data,
+      url: firstNonEmpty(
+        process.env.URL,
+        process.env.FMPERF_ENDPOINT_URL,
+        process.env.ENDPOINT_URL,
+      ),
       resultsScope,
       resultsRoot: toPosixRelative(basePath),
     });

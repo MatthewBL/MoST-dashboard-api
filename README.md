@@ -16,7 +16,7 @@ By default, the API listens on `http://localhost:4000`.
 
 - `GET /health`
 - `GET /api/llm-name`
-- `GET /api/gpu-used`
+- `GET /api/gpu-used` — GPU label plus the model endpoint `url` read from the project `.env` (`URL`, `FMPERF_ENDPOINT_URL` or `ENDPOINT_URL`), which the dashboard uses to resolve the node and port for `job-gpu-count`.
 - `GET /api/results-scopes`
 - `GET /api/experiments`
 - `GET /api/experiment-status` — checks whether the experiment is currently running by comparing the most recent `slurm-XXXXX.out` job id against the ids reported by `squeue`.
