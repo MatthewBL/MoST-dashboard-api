@@ -1,4 +1,4 @@
-# MoST Local API
+﻿# MoST Local API
 
 This folder contains a local Node.js API to expose experiment data under `../results` for a local dashboard.
 
@@ -21,7 +21,7 @@ By default, the API listens on `http://localhost:4000`.
 - `GET /api/experiments`
 - `GET /api/experiment-status` — checks whether the experiment is currently running by comparing the most recent `slurm-XXXXX.out` job id against the ids reported by `squeue`.
 - `GET /api/experiment-log?lines=N` — returns the content of the most recent `slurm-XXXXX.out` log. Without `lines`, the whole file is returned; with `lines=N`, only the last `N` lines are returned.
-- `GET /api/job-gpu-count?model=MODEL_ID&node=NODE&port=PORT` — finds the running Slurm job that serves the given model on the given node and port (via `squeue` and `scontrol show job`), and returns the number of GPUs it uses (from `TresPerJob`).
+- `GET /api/job-gpu-count?model=MODEL_ID&node=NODE&port=PORT` — returns the number of GPUs used by the Slurm job serving the given model on the given node and port. Delegates to the shared `MoST-experiment-environment/fmperf/utils/GpuCount.py` helper (`squeue` + `scontrol show job`, `TresPerJob`). When the job cannot be inspected (e.g. it already finished), it falls back to the `GPU_COUNT` stored in the latest `results.csv` of the requested results scope.
 - `GET /api/experiments/:experiment/iterations`
 - `GET /api/experiments/:experiment/iterations/:iteration/results.csv`
 - `GET /api/experiments/:experiment/iterations/:iteration/download/results.csv`
@@ -37,4 +37,4 @@ By default, the API listens on `http://localhost:4000`.
 - Experiment endpoints accept `?resultsScope=current|MST_1|MST-2|...`.
 - `current` reads from `results/` directly, while other scopes read from subfolders like `results/MST_1/`.
 - Slurm log files named `slurm-XXXXX.out` are read directly from `MOST_PROJECT_ROOT` (the project root). The most recent log is the one with the largest numeric job id. When `squeue` is unavailable, `experiment-status` reports `isRunning: null` and `squeueAvailable: false` instead of failing.
-- `job-gpu-count` lists the running jobs on the requested node with `squeue`, inspects each with `scontrol show job <id>`, and reads the GPU count from `TresPerJob`. When `squeue`/`scontrol` are unavailable it responds `503 SQUEUE_UNAVAILABLE`; when no job matches the model, node and port it responds `404 JOB_NOT_FOUND`.
+- `job-gpu-count` delegates to the shared script `<MOST_PROJECT_ROOT>/MoST-experiment-environment/fmperf/utils/GpuCount.py` (spawned as `python GpuCount.py find --model ... --node ... --port ...`), which lists the running jobs on the requested node with `squeue`, inspects each with `scontrol show job <id>`, and reads the GPU count from `TresPerJob`. When `squeue`/`scontrol` are unavailable it responds `503 SQUEUE_UNAVAILABLE`; when no job matches the model, node and port it responds `404 JOB_NOT_FOUND`; if the job cannot be inspected, the endpoint falls back to the `GPU_COUNT` column of the latest iteration `results.csv` and returns it with `source: "results/..."`.

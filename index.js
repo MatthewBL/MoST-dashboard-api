@@ -1,4 +1,4 @@
-const fs = require("node:fs/promises");
+﻿const fs = require("node:fs/promises");
 const path = require("node:path");
 const http = require("node:http");
 const https = require("node:https");
@@ -587,6 +587,8 @@ async function resolveGpuUsed(resultsBasePath) {
     if (csvRecords && csvRecords.length > 0) {
       const row = csvRecords[0];
       const gpuFromCsv = firstNonEmpty(
+        row.GPU_COUNT,
+        row.gpu_count,
         row.GPU,
         row.gpu,
         row.GPU_USED,
@@ -690,165 +692,107 @@ async function getRunningSlurmJobIds() {
   return jobIds;
 }
 
-function nodeListIncludesNode(nodeList, targetNode) {
-  return String(nodeList || "")
-    .split(/[\s,]+/)
-    .filter(Boolean)
-    .some((candidate) => candidate === targetNode || nodeRangeIncludesNode(candidate, targetNode));
+function resolveGpuCountScriptPath() {
+  return path.join(
+    projectRoot,
+    "fmperf",
+    "utils",
+    "GpuCount.py",
+  );
 }
 
-function nodeRangeIncludesNode(candidate, targetNode) {
-  const match = /^(.*?)\[([^\]]+)\](.*)$/.exec(candidate);
-  if (!match) {
-    return false;
-  }
-
-  const prefix = match[1];
-  const body = match[2];
-  const suffix = match[3];
-  if (!targetNode.startsWith(prefix) || !targetNode.endsWith(suffix)) {
-    return false;
-  }
-
-  const numericPart = targetNode.slice(prefix.length, targetNode.length - suffix.length);
-  if (!/^\d+$/.test(numericPart)) {
-    return false;
-  }
-
-  const value = Number(numericPart);
-  const width = numericPart.length;
-  return body.split(",").some((segment) => {
-    const trimmed = segment.trim();
-    const range = /^(\d+)-(\d+)$/.exec(trimmed);
-    if (!range) {
-      return trimmed === numericPart;
+function runPythonCaptureJson(scriptPath, args, timeoutMs = SQUEUE_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(process.env.PYTHON || "python", [scriptPath, ...args], {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: timeoutMs,
+      });
+    } catch {
+      resolve(null);
+      return;
     }
-    const start = Number(range[1]);
-    const end = Number(range[2]);
-    if (value < start || value > end) {
-      return false;
-    }
-    // Zero-padded ranges (e.g. gpu[07-08]) only match same-width names.
-    return range[1].length !== range[2].length || width === range[1].length;
+
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+
+    const fail = () => resolve(null);
+    child.on("error", fail);
+    child.on("timeout", fail);
+    child.on("close", (code) => {
+      let data = null;
+      try {
+        data = JSON.parse(stdout.trim());
+      } catch {
+        // stdout was not JSON; treat as an unparseable outcome below.
+      }
+      resolve({ exited: code, data });
+    });
   });
 }
 
-async function getRunningJobsOnNode(node) {
-  const stdout = await runCommandCaptureStdout("squeue", ["--noheader", "-t", "RUNNING", "--format=%i %N"]);
-  if (stdout === null) {
-    return null;
-  }
-
-  const jobIds = [];
-  for (const line of stdout.split(/\r?\n/)) {
-    const match = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
-    if (!match || !nodeListIncludesNode(match[2].trim(), node)) {
-      continue;
-    }
-    jobIds.push(Number(match[1]));
-  }
-  return jobIds;
-}
-
-function parseScontrolOutput(stdout) {
-  const fields = {};
-  let currentKey = null;
-
-  for (const token of String(stdout).split(/\s+/)) {
-    const eqIndex = token.indexOf("=");
-    if (eqIndex > 0 && /^[A-Za-z][A-Za-z0-9:_-]*$/.test(token.slice(0, eqIndex))) {
-      currentKey = token.slice(0, eqIndex);
-      fields[currentKey] = token.slice(eqIndex + 1);
-    } else if (currentKey) {
-      // Bare token without "=" (e.g. the model and port of Command) continues
-      // the previous field's value.
-      fields[currentKey] += ` ${token}`;
-    }
-  }
-
-  return fields;
-}
-
-async function getJobInfo(jobId) {
-  const stdout = await runCommandCaptureStdout("scontrol", ["show", "job", String(jobId)]);
-  return stdout === null ? null : parseScontrolOutput(stdout);
-}
-
-function extractGpuCountFromTresPerJob(tresPerJob) {
-  const parts = String(tresPerJob || "").split(":");
-  const count = Number(parts[parts.length - 1]);
-  return Number.isInteger(count) && count >= 0 ? count : null;
-}
-
-function commandModelMatches(commandModel, modelId) {
-  const expected = String(modelId || "").trim();
-  const actual = String(commandModel || "").trim();
-  if (!expected || !actual) {
-    return false;
-  }
-  if (actual === expected) {
-    return true;
-  }
-
-  // Accept the last path segment of the model id, e.g. "Llama-3.3-70B-Instruct".
-  return actual.split("/").pop() === expected.split("/").pop();
-}
-
 async function findModelJobGpuCount({ modelId, node, port }) {
-  const runningJobIds = await getRunningJobsOnNode(node);
-  if (runningJobIds === null) {
-    const error = new Error("squeue is unavailable.");
+  const scriptPath = resolveGpuCountScriptPath();
+  const captured = await runPythonCaptureJson(scriptPath, [
+    "find",
+    "--model",
+    modelId,
+    "--node",
+    node,
+    "--port",
+    port,
+  ]);
+
+  if (!captured || !captured.data) {
+    const error = new Error("The GPU count helper is unavailable.");
+    error.code = "GPU_HELPER_UNAVAILABLE";
+    throw error;
+  }
+
+  if (!captured.data.error) {
+    return captured.data;
+  }
+
+  if (captured.data.code === "SQUEUE_UNAVAILABLE") {
+    const error = new Error(captured.data.error);
     error.code = "SQUEUE_UNAVAILABLE";
     throw error;
   }
 
-  if (runningJobIds.length === 0) {
-    const error = new Error(`No running jobs found on node "${node}".`);
-    error.code = "JOB_NOT_FOUND";
-    throw error;
-  }
-
-  for (const jobId of runningJobIds) {
-    const info = await getJobInfo(jobId);
-    if (!info || info.JobState !== "RUNNING") {
-      continue;
-    }
-
-    const commandParts = String(info.Command || "").split(/\s+/).filter(Boolean);
-    if (commandParts.length < 3) {
-      // Not a model-serving job: the command has no model and port.
-      continue;
-    }
-
-    const commandModel = commandParts[1];
-    const commandPort = commandParts[2];
-    if (!commandModelMatches(commandModel, modelId)) {
-      continue;
-    }
-    if (commandPort !== String(port)) {
-      continue;
-    }
-
-    const gpuCount = extractGpuCountFromTresPerJob(info.TresPerJob);
-    if (gpuCount === null) {
-      continue;
-    }
-
-    return {
-      jobId,
-      node,
-      model: commandModel,
-      port: commandPort,
-      gpuCount,
-      source: "slurm",
-    };
-  }
-
-  const error = new Error(
-    `No running job found on node "${node}" serving model "${modelId}" on port "${port}".`,
-  );
+  const error = new Error(captured.data.error);
   error.code = "JOB_NOT_FOUND";
   throw error;
+}
+
+async function resolveGpuCountFromResults(req) {
+  const resultsScope = getResultsScopeFromRequest(req);
+  const basePath = await resolveResultsBasePath(resultsScope);
+  const latest = await findLatestIterationFolder(basePath);
+  if (!latest) {
+    return null;
+  }
+
+  const csvRecords = await tryReadCsvRecords(path.join(latest.path, "results.csv"));
+  if (!csvRecords || csvRecords.length === 0) {
+    return null;
+  }
+
+  const row = csvRecords[0];
+  const rawCount = firstNonEmpty(row.GPU_COUNT, row.gpu_count, row.GPUS, row.gpus);
+  if (!rawCount) {
+    return null;
+  }
+
+  const numeric = Number(rawCount);
+  return {
+    gpuCount: Number.isInteger(numeric) ? numeric : rawCount,
+    source: "results/" + latest.experiment + "/" + latest.iteration + "/results.csv",
+    resultsScope,
+  };
 }
 
 async function resolveExperimentStatus(basePath) {
@@ -1036,8 +980,29 @@ app.get("/api/job-gpu-count", async (req, res, next) => {
       throw error;
     }
 
-    const data = await findModelJobGpuCount({ modelId, node, port });
-    res.json(data);
+    try {
+      const data = await findModelJobGpuCount({ modelId, node, port });
+      res.json(data);
+      return;
+    } catch (jobError) {
+      // The job may have ended or Slurm may be unavailable; fall back to the
+      // GPU_COUNT recorded in the latest results.csv of the requested scope.
+      if (jobError && ["JOB_NOT_FOUND", "SQUEUE_UNAVAILABLE", "GPU_HELPER_UNAVAILABLE"].includes(jobError.code)) {
+        const fromResults = await resolveGpuCountFromResults(req);
+        if (fromResults) {
+          res.json({
+            ...fromResults,
+            model: modelId,
+            node,
+            port,
+            inspectionError: jobError.message,
+            inspectionCode: jobError.code,
+          });
+          return;
+        }
+      }
+      throw jobError;
+    }
   } catch (error) {
     next(error);
   }
